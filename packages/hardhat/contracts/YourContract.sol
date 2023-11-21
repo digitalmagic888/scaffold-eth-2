@@ -1,87 +1,126 @@
-//SPDX-License-Identifier: MIT
-pragma solidity >=0.8.0 <0.9.0;
 
-// Useful for debugging. Remove when deploying to a live network.
-import "hardhat/console.sol";
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
 
-// Use openzeppelin to inherit battle-tested implementations (ERC20, ERC721, etc)
-// import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-/**
- * A smart contract that allows changing a state variable of the contract and tracking the changes
- * It also allows the owner to withdraw the Ether in the contract
- * @author BuidlGuidl
- */
-contract YourContract {
-	// State Variables
-	address public immutable owner;
-	string public greeting = "Building Unstoppable Apps!!!";
-	bool public premium = false;
-	uint256 public totalCounter = 0;
-	mapping(address => uint) public userGreetingCounter;
+contract StakingContract {
+    struct Pool {
+        IERC20 stakingToken;
+        IERC20 rewardToken;
+        uint256 rewardRatePerBlock;
+        uint256 lastRewardBlock;
+        uint256 accRewardPerShare;
+    }
 
-	// Events: a way to emit log statements from smart contract that can be listened to by external parties
-	event GreetingChange(
-		address indexed greetingSetter,
-		string newGreeting,
-		bool premium,
-		uint256 value
-	);
+    struct UserInfo {
+        uint256 amount; // How many tokens the user has staked.
+        uint256 rewardDebt; // Reward debt.
+    }
 
-	// Constructor: Called once on contract deployment
-	// Check packages/hardhat/deploy/00_deploy_your_contract.ts
-	constructor(address _owner) {
-		owner = _owner;
-	}
+    mapping(uint256 => Pool) public pools;
+    mapping(uint256 => mapping(address => UserInfo)) public userInfo;
+    uint256 public poolCount;
 
-	// Modifier: used to define a set of rules that must be met before or after a function is executed
-	// Check the withdraw() function
-	modifier isOwner() {
-		// msg.sender: predefined variable that represents address of the account that called the current function
-		require(msg.sender == owner, "Not the Owner");
-		_;
-	}
+    event PoolAdded(uint256 indexed poolId, address stakingToken, address rewardToken, uint256 rewardRatePerBlock);
+    event Staked(address indexed user, uint256 indexed poolId, uint256 amount);
+    event Unstaked(address indexed user, uint256 indexed poolId, uint256 amount);
+    event RewardClaimed(address indexed user, uint256 indexed poolId, uint256 amount);
 
-	/**
-	 * Function that allows anyone to change the state variable "greeting" of the contract and increase the counters
-	 *
-	 * @param _newGreeting (string memory) - new greeting to save on the contract
-	 */
-	function setGreeting(string memory _newGreeting) public payable {
-		// Print data to the hardhat chain console. Remove when deploying to a live network.
-		console.log(
-			"Setting new greeting '%s' from %s",
-			_newGreeting,
-			msg.sender
-		);
+    constructor() {}
 
-		// Change state variables
-		greeting = _newGreeting;
-		totalCounter += 1;
-		userGreetingCounter[msg.sender] += 1;
+    function addPool(
+        address _stakingToken,
+        address _rewardToken,
+        uint256 _rewardRatePerBlock
+    ) external {
+        pools[poolCount] = Pool({
+            stakingToken: IERC20(_stakingToken),
+            rewardToken: IERC20(_rewardToken),
+            rewardRatePerBlock: _rewardRatePerBlock,
+            lastRewardBlock: block.number,
+            accRewardPerShare: 0
+        });
+        emit PoolAdded(poolCount, _stakingToken, _rewardToken, _rewardRatePerBlock);
+        poolCount++;
+    }
 
-		// msg.value: built-in global variable that represents the amount of ether sent with the transaction
-		if (msg.value > 0) {
-			premium = true;
-		} else {
-			premium = false;
-		}
+    function stake(uint256 _poolId, uint256 _amount) external {
+        Pool storage pool = pools[_poolId];
+        UserInfo storage user = userInfo[_poolId][msg.sender];
 
-		// emit: keyword used to trigger an event
-		emit GreetingChange(msg.sender, _newGreeting, msg.value > 0, 0);
-	}
+        updatePool(_poolId);
 
-	/**
-	 * Function that allows the owner to withdraw all the Ether in the contract
-	 * The function can only be called by the owner of the contract as defined by the isOwner modifier
-	 */
-	function withdraw() public isOwner {
-		(bool success, ) = owner.call{ value: address(this).balance }("");
-		require(success, "Failed to send Ether");
-	}
+        if (user.amount > 0) {
+            uint256 pending = user.amount * pool.accRewardPerShare / 1e12 - user.rewardDebt;
+            safeRewardTransfer(msg.sender, pending);
+        }
 
-	/**
-	 * Function that allows the contract to receive ETH
-	 */
-	receive() external payable {}
+        pool.stakingToken.transferFrom(address(msg.sender), address(this), _amount);
+        user.amount += _amount;
+        user.rewardDebt = user.amount * pool.accRewardPerShare / 1e12;
+
+        emit Staked(msg.sender, _poolId, _amount);
+    }
+
+    function unstake(uint256 _poolId, uint256 _amount) external {
+        Pool storage pool = pools[_poolId];
+        UserInfo storage user = userInfo[_poolId][msg.sender];
+
+        require(user.amount >= _amount, "unstake: not good");
+
+        updatePool(_poolId);
+
+        uint256 pending = user.amount * pool.accRewardPerShare / 1e12 - user.rewardDebt;
+        safeRewardTransfer(msg.sender, pending);
+
+        user.amount -= _amount;
+        user.rewardDebt = user.amount * pool.accRewardPerShare / 1e12;
+
+        pool.stakingToken.transfer(address(msg.sender), _amount);
+
+        emit Unstaked(msg.sender, _poolId, _amount);
+    }
+
+    function claimReward(uint256 _poolId) external {
+        Pool storage pool = pools[_poolId];
+        UserInfo storage user = userInfo[_poolId][msg.sender];
+
+        updatePool(_poolId);
+
+        uint256 pending = user.amount * pool.accRewardPerShare / 1e12 - user.rewardDebt;
+        safeRewardTransfer(msg.sender, pending);
+        user.rewardDebt = user.amount * pool.accRewardPerShare / 1e12;
+
+        emit RewardClaimed(msg.sender, _poolId, pending);
+    }
+
+    function updatePool(uint256 _poolId) internal {
+        Pool storage pool = pools[_poolId];
+        if (block.number <= pool.lastRewardBlock) {
+            return;
+        }
+
+        uint256 lpSupply = pool.stakingToken.balanceOf(address(this));
+        if (lpSupply == 0) {
+            pool.lastRewardBlock = block.number;
+            return;
+        }
+
+        uint256 blocks = block.number - pool.lastRewardBlock;
+        uint256 reward = blocks * pool.rewardRatePerBlock;
+
+        pool.accRewardPerShare += reward / lpSupply / 1e12;
+        pool.lastRewardBlock = block.number;
+    }
+
+    function safeRewardTransfer(address _to, uint256 _amount) internal {
+        Pool storage pool = pools[0]; // Assuming pool ID 0 is the reward pool
+        uint256 rewardBal = pool.rewardToken.balanceOf(address(this));
+        if (_amount > rewardBal) {
+            pool.rewardToken.transfer(_to, rewardBal);
+        } else {
+            pool.rewardToken.transfer(_to, _amount);
+        }
+    }
 }
